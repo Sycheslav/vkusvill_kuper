@@ -49,7 +49,8 @@ async def get_coords_by_city(city_name: str) -> tuple[float, float]:
                 "fields": "items.full_address_name,items.address,items.adm_div,items.point",
                 "location": "37.584212,55.645531"
             },
-            headers=headers
+            headers=headers,
+            timeout=settings.HTTP_TIMEOUT_SEC
         )
         data = resp.json()
         items = data.get("result", {}).get("items", [])

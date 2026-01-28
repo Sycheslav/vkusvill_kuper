@@ -44,6 +44,32 @@ class VkusvillParser(BaseParser):
             await r.rpush(self.PROXY_REDIS_KEY, proxy)
             logger.info("Прокси %s возвращен в очередь.", proxy)
 
+    async def _request_json(
+        self,
+        session: AsyncSession,
+        url: str,
+        *,
+        params: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        timeout: Optional[int] = None,
+    ):
+        timeout = timeout or settings.HTTP_TIMEOUT_SEC
+        retries = max(settings.HTTP_RETRIES, 0)
+        backoff = max(settings.HTTP_RETRY_BACKOFF_SEC, 0)
+
+        for attempt in range(retries + 1):
+            try:
+                resp = await session.get(url, params=params, headers=headers, timeout=timeout)
+                status = getattr(resp, "status", None)
+                if status and status != 200:
+                    raise ValueError(f"HTTP {status}")
+                return resp.json()
+            except Exception as e:
+                if attempt >= retries:
+                    logger.warning("Vkusvill request failed: %s", e)
+                    return None
+                await asyncio.sleep(backoff * (attempt + 1))
+
     async def _get_session_for_city(self, city_input: str, r: redis.Redis) -> tuple[AsyncSession, Optional[str]]:
         key = city_input.strip().lower()
         lat, lon = None, None
@@ -106,7 +132,8 @@ class VkusvillParser(BaseParser):
             resp = await session.get(
                 f"{self.BASE_URL}/stores/getNearbyNew/",
                 params=params,
-                headers=self.HEADERS
+                headers=self.HEADERS,
+                timeout=settings.HTTP_TIMEOUT_SEC
             )
             result = resp.json().get("stores")[0]
             shopno = result.get("ShopNo")
@@ -117,7 +144,12 @@ class VkusvillParser(BaseParser):
                 'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[ShopAddressesFragmentV2]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-25]}{[def_id_service]}{[3]}{[def_type_service]}{[3]}{[def_gettype]}{[0]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[7660]}{[def_slot_during]}{[null]}{[def_slot_since]}{[11:00:00]}{[def_slot_until]}{[13:00:00]}{[user_number]}{[&]ё4464]}{[ts]}{[1729704763853]}{[method]}{[/api/takeaway/addPickupAddresses/]}',
             }
 
-            await session.get(f"{self.BASE_URL}/takeaway/addPickupAddresses/", params=params, headers=self.HEADERS)
+            await session.get(
+                f"{self.BASE_URL}/takeaway/addPickupAddresses/",
+                params=params,
+                headers=self.HEADERS,
+                timeout=settings.HTTP_TIMEOUT_SEC
+            )
             data = {
                 'number': '&]ё4464',
                 'shopNo': str(shopno),
@@ -133,7 +165,12 @@ class VkusvillParser(BaseParser):
                 'package_id': '0',
                 'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[AddressesFragmentV2]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-25]}{[def_id_service]}{[3]}{[def_type_service]}{[3]}{[def_gettype]}{[0]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[2284]}{[def_slot_during]}{[null]}{[def_slot_since]}{[10:00:00]}{[def_slot_until]}{[12:00:00]}{[user_number]}{[&]ё4464]}{[ts]}{[1729705163318]}{[method]}{[/api/takeaway/updCartHeader/]}',
             }
-            await session.post(f"{self.BASE_URL}/takeaway/updCartHeader/", json=data, headers=self.HEADERS)
+            await session.post(
+                f"{self.BASE_URL}/takeaway/updCartHeader/",
+                json=data,
+                headers=self.HEADERS,
+                timeout=settings.HTTP_TIMEOUT_SEC
+            )
             logger.info("ВкусВилл: гео %s | прокси: %s", city_input, "да" if proxy else "нет")
         except Exception as e:
             logger.error(f"Ошибка установки гео ВкусВилл {city_input}: {e}")
@@ -157,6 +194,14 @@ class VkusvillParser(BaseParser):
         start = time.time()
         products = []
 
+        try:
+            limit = int(task.limit) if task.limit else 500
+        except (TypeError, ValueError):
+            limit = 500
+        if limit < 1:
+            limit = 500
+        stop_event = asyncio.Event()
+
         city = task.city.strip().lower() or "москва"
         session, current_proxy = await self._get_session_for_city(task.city, r)
 
@@ -178,9 +223,13 @@ class VkusvillParser(BaseParser):
                 'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-10]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[56]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[6098]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1728539006506]}{[method]}{[/api/bff/get_screen_widgets]}',
             }
 
-            resp = await session.get(f"{self.BASE_URL}/bff/get_screen_widgets", params=params, headers=self.HEADERS)
-            logger.debug("widgets %s", resp)
-            widgets = resp.json().get("widgets", [])
+            data = await self._request_json(
+                session,
+                f"{self.BASE_URL}/bff/get_screen_widgets",
+                params=params,
+                headers=self.HEADERS,
+            )
+            widgets = data.get("widgets", []) if isinstance(data, dict) else []
 
             tasks = []
             
@@ -199,7 +248,17 @@ class VkusvillParser(BaseParser):
                             continue
                         
                         logger.info(f"Найдена категория: {title} (ID: {cat_id})")
-                        tasks.append(self._fetch_category_fast(session, str(cat_id), title, heavy_df, products))
+                        tasks.append(
+                            self._fetch_category_fast(
+                                session,
+                                str(cat_id),
+                                title,
+                                heavy_df,
+                                products,
+                                limit,
+                                stop_event
+                            )
+                        )
             
             if not tasks:
                  logger.warning("Не найдена категория 'Готовая еда' в виджетах")
@@ -212,6 +271,9 @@ class VkusvillParser(BaseParser):
         finally:
             if current_proxy:
                 await self._checkin_proxy(r, current_proxy)
+
+        if limit and len(products) > limit:
+            products = products[:limit]
 
         took = round(time.time() - start, 1)
         logger.info("Vkusvill fast завершён | товаров: %d | время: %.1fс | кэш: %s", len(products), took, "ДА" if heavy_df is not None else "НЕТ")
@@ -226,12 +288,27 @@ class VkusvillParser(BaseParser):
             chat_id=task.chat_id
         )
 
-    async def _fetch_category_fast(self, session, cat_id: str, category: str, heavy_df, result_list: list):
-        limit = 24
+    async def _fetch_category_fast(
+        self,
+        session,
+        cat_id: str,
+        category: str,
+        heavy_df,
+        result_list: list,
+        max_products: int,
+        stop_event: asyncio.Event
+    ):
+        page_limit = 24
         page = 1
         
         while True:
-            offset = (page - 1) * limit
+            if stop_event.is_set():
+                break
+            if max_products and len(result_list) >= max_products:
+                stop_event.set()
+                break
+
+            offset = (page - 1) * page_limit
             
             params = [
                 ('all_products', 'true'),
@@ -240,27 +317,26 @@ class VkusvillParser(BaseParser):
                 ('number', '&_5>527'),
                 ('sort_id', '7'),
                 ('offset', str(offset)),
-                ('limit', str(limit)),
+                ('limit', str(page_limit)),
                 ('offline', '0'),
                 ('all_products', 'false'),
                 ('str_par', '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogMainFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-18]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[4]}{[def_Number_button]}{[1]}{[def_ShopNo]}{[3700]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1729253880342]}{[method]}{[/api/bff/get_widget_content]}'),
             ]
 
             try:
-                resp = await session.get(
+                data = await self._request_json(
+                    session,
                     f"{self.BASE_URL}/bff/get_widget_content",
                     params=params,
-                    headers=self.HEADERS
+                    headers=self.HEADERS,
                 )
-                logger.debug("page_resp fast %s %s %s %s", resp, offset, limit, cat_id)
-                
-                data = resp.json()
 
-                if not data:
+                if not data or not isinstance(data, list):
                     break
-            
 
                 for item in data:
+                    if stop_event.is_set():
+                        break
                     pid = str(item["id"])
                     name = item.get("title", "Без названия")
                     
@@ -310,6 +386,10 @@ class VkusvillParser(BaseParser):
                         in_stock=in_stock,
                         url=url
                     ))
+
+                    if max_products and len(result_list) >= max_products:
+                        stop_event.set()
+                        break
 
                 page += 1
 
@@ -361,8 +441,13 @@ class VkusvillParser(BaseParser):
                 'all_products': 'false',
                 'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-10]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[56]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[6098]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1728539006506]}{[method]}{[/api/bff/get_screen_widgets]}',
             }
-            resp = await session.get(f"{self.BASE_URL}/bff/get_screen_widgets", params=params, headers=self.HEADERS)
-            widgets = resp.json().get("widgets", [])
+            data = await self._request_json(
+                session,
+                f"{self.BASE_URL}/bff/get_screen_widgets",
+                params=params,
+                headers=self.HEADERS,
+            )
+            widgets = data.get("widgets", []) if isinstance(data, dict) else []
             
             categories_to_parse = []
             for widget in widgets:
@@ -399,15 +484,13 @@ class VkusvillParser(BaseParser):
                         ('str_par', '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogMainFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-18]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[4]}{[def_Number_button]}{[1]}{[def_ShopNo]}{[3700]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1729253880342]}{[method]}{[/api/bff/get_widget_content]}'),
                     ]
 
-                    page_resp = await session.get(
+                    data = await self._request_json(
+                        session,
                         f"{self.BASE_URL}/bff/get_widget_content",
                         params=params,
-                        headers=self.HEADERS
+                        headers=self.HEADERS,
                     )
-                    logger.debug("page_resp %s %s", page_resp, offset)
-                    
-                    data = page_resp.json()
-                    
+
                     if not data:
                         break
 

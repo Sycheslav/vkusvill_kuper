@@ -47,8 +47,10 @@ class KuperParser(BaseParser):
 
     async def _get_store_id(self, lat, lon, store_name: str) -> str:
         params = {'shipping_method': 'by_courier', 'lat': str(lat), 'lon': str(lon), 'include_labels_tree': 'true'}
-        resp = await self.session.get(f"{self.BASE_URL}/stores", params=params, headers=self.HEADERS)
-        stores = resp.json().get("stores", [])
+        data = await self._request_json(f"{self.BASE_URL}/stores", params=params, headers=self.HEADERS)
+        stores = data.get("stores", []) if isinstance(data, dict) else []
+        if not stores:
+            return None
         store_key = store_name.lower()
         for store in stores:
             if store_key in store.get("name", "").lower():
@@ -73,6 +75,31 @@ class KuperParser(BaseParser):
             if value:
                 return value
         return None
+
+    async def _request_json(
+        self,
+        url: str,
+        *,
+        params: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        timeout: Optional[int] = None,
+    ):
+        timeout = timeout or settings.HTTP_TIMEOUT_SEC
+        retries = max(settings.HTTP_RETRIES, 0)
+        backoff = max(settings.HTTP_RETRY_BACKOFF_SEC, 0)
+
+        for attempt in range(retries + 1):
+            try:
+                resp = await self.session.get(url, params=params, headers=headers, timeout=timeout)
+                status = getattr(resp, "status", None)
+                if status and status != 200:
+                    raise ValueError(f"HTTP {status}")
+                return resp.json()
+            except Exception as e:
+                if attempt >= retries:
+                    logger.warning("Kuper request failed: %s", e)
+                    return None
+                await asyncio.sleep(backoff * (attempt + 1))
     
     async def parse(self, task: Task) -> ParseResult:
         if task.mode == "fast":
@@ -86,6 +113,13 @@ class KuperParser(BaseParser):
             start = time.time()
             products = []
             self.current_store = (task.store or "лента").lower().strip()
+            try:
+                limit = int(task.limit) if task.limit else 500
+            except (TypeError, ValueError):
+                limit = 500
+            if limit < 1:
+                limit = 500
+            stop_event = asyncio.Event()
             city = task.city.strip() or "москва"
             city_name, lat, lon = parse_city_or_coords(task.city)
             if lat is not None and lon is not None:
@@ -105,9 +139,17 @@ class KuperParser(BaseParser):
 
             try:
                 result = await self._get_store_id(use_lat, use_lon, self.current_store)
-                store_id = result[0]
-                self.current_store = result[1]
-                taxons = (await self.session.get(f"{self.BASE_URL}/taxons", params={"sid": store_id}, headers=self.HEADERS)).json().get("taxons", [])
+                if not result:
+                    logger.warning("Kuper fast | магазин не найден для %s", self.current_store)
+                    raise ValueError("Store not found")
+                store_id, store_name = result
+                self.current_store = store_name
+                taxon_data = await self._request_json(
+                    f"{self.BASE_URL}/taxons",
+                    params={"sid": store_id},
+                    headers=self.HEADERS
+                )
+                taxons = taxon_data.get("taxons", []) if isinstance(taxon_data, dict) else []
 
                 tasks = []
                 for taxon in taxons:
@@ -119,7 +161,9 @@ class KuperParser(BaseParser):
                         tid=taxon["id"],
                         category=name,
                         heavy_df=heavy_df,
-                        result=products
+                        result=products,
+                        max_products=limit,
+                        stop_event=stop_event
                     ))
 
                 if tasks:
@@ -129,6 +173,8 @@ class KuperParser(BaseParser):
                 logger.error("Kuper fast error: %s", e, exc_info=True)
 
             took = round(time.time() - start, 1)
+            if limit and len(products) > limit:
+                products = products[:limit]
             logger.info("Kuper fast | %d товаров | %.1fс | кэш: %s", len(products), took, "ДА" if heavy_df is not None else "НЕТ")
 
             return ParseResult(
@@ -141,15 +187,37 @@ class KuperParser(BaseParser):
                 chat_id=task.chat_id
             )
 
-    async def _fetch_fast(self, store_id: str, tid: str, category: str, heavy_df, result: list):
+    async def _fetch_fast(
+        self,
+        store_id: str,
+        tid: str,
+        category: str,
+        heavy_df,
+        result: list,
+        max_products: int,
+        stop_event: asyncio.Event
+    ):
         offset = 0
         while True:
-            params = {"sid": store_id, "tid": tid, "limit": "24", "products_offset": str(offset), "sort": "popularity"}
-            resp = await self.session.get(f"{self.BASE_URL}/catalog/entities", params=params, headers=self.HEADERS)
-            if resp.status != 200 or not resp.json().get("entities"):
+            if stop_event.is_set():
+                break
+            if max_products and len(result) >= max_products:
+                stop_event.set()
                 break
 
-            for e in resp.json()["entities"]:
+            params = {"sid": store_id, "tid": tid, "limit": "24", "products_offset": str(offset), "sort": "popularity"}
+            data = await self._request_json(
+                f"{self.BASE_URL}/catalog/entities",
+                params=params,
+                headers=self.HEADERS
+            )
+            entities = data.get("entities", []) if isinstance(data, dict) else []
+            if not entities:
+                break
+
+            for e in entities:
+                if stop_event.is_set():
+                    break
 
                 sku = str(e.get("sku") or "")
                 region_id = str(e["id"])
@@ -192,12 +260,22 @@ class KuperParser(BaseParser):
                     url=url
                 ))
 
+                if max_products and len(result) >= max_products:
+                    stop_event.set()
+                    break
+
             offset += 24
 
     async def parse_heavy(self, task: Task) -> ParseResult:
         self.current_store = (task.store or "лента").lower().strip()
         start = time.time()
         detailed = []
+        try:
+            limit = int(task.limit) if task.limit else 2000
+        except (TypeError, ValueError):
+            limit = 2000
+        if limit < 1:
+            limit = 2000
 
         try:
             city_name, lat, lon = parse_city_or_coords(task.city)
@@ -207,33 +285,49 @@ class KuperParser(BaseParser):
                 use_lat, use_lon = await get_coords_by_city(city_name)
 
             result = await self._get_store_id(use_lat, use_lon, self.current_store)
-            store_id = result[0]
-            self.current_store = result[1]
-            taxons_resp = await self.session.get(f"{self.BASE_URL}/taxons", params={"sid": store_id}, headers=self.HEADERS)
-            taxons = taxons_resp.json().get("taxons", [])
+            if not result:
+                logger.warning("Kuper heavy | магазин не найден для %s", self.current_store)
+                raise ValueError("Store not found")
+            store_id, store_name = result
+            self.current_store = store_name
+            taxon_data = await self._request_json(
+                f"{self.BASE_URL}/taxons",
+                params={"sid": store_id},
+                headers=self.HEADERS
+            )
+            taxons = taxon_data.get("taxons", []) if isinstance(taxon_data, dict) else []
 
             cache_rows = []
 
             for taxon in taxons:
+                if limit and len(detailed) >= limit:
+                    break
                 cat_name = taxon.get("name", "")
                 if not any(kw in cat_name.lower() for kw in ["готовая еда"]):
                     continue
 
                 offset = 0
                 while True:
-                    entities_resp = await self.session.get(f"{self.BASE_URL}/catalog/entities", params={
-                        "sid": store_id,
-                        "tid": taxon["id"],
-                        "limit": "24",
-                        "products_offset": str(offset),
-                        "sort": "popularity"
-                    }, headers=self.HEADERS)
-
-                    entities = entities_resp.json().get("entities", [])
+                    if limit and len(detailed) >= limit:
+                        break
+                    entities_data = await self._request_json(
+                        f"{self.BASE_URL}/catalog/entities",
+                        params={
+                            "sid": store_id,
+                            "tid": taxon["id"],
+                            "limit": "24",
+                            "products_offset": str(offset),
+                            "sort": "popularity"
+                        },
+                        headers=self.HEADERS
+                    )
+                    entities = entities_data.get("entities", []) if isinstance(entities_data, dict) else []
                     if not entities:
                         break
 
                     for e in entities:
+                        if limit and len(detailed) >= limit:
+                            break
                         if e.get("type") != "product":
                             continue
 
@@ -242,10 +336,13 @@ class KuperParser(BaseParser):
                         if not sku or sku == "None" or sku == "nan":
                             continue 
 
-                        card_resp = await self.session.get(f"{self.BASE_URL}/multicards/{region_id}", headers=self.HEADERS)
-                        if card_resp.status != 200:
+                        card_data = await self._request_json(
+                            f"{self.BASE_URL}/multicards/{region_id}",
+                            headers=self.HEADERS
+                        )
+                        if not isinstance(card_data, dict):
                             continue
-                        data = card_resp.json().get("product", {})
+                        data = card_data.get("product", {})
 
                         props = {p["name"]: p["value"] for p in data.get("properties", [])}
                         stock = data.get("stock", 0) or data.get("stock_info", {}).get("quantity", 0)

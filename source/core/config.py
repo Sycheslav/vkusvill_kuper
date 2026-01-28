@@ -51,4 +51,9 @@ class Settings(BaseSettings):
     # API ключ 2GIS для геокодинга
     DGIS_API_KEY: str = ""
 
+    # HTTP настройки для устойчивых запросов
+    HTTP_TIMEOUT_SEC: int = 20
+    HTTP_RETRIES: int = 2
+    HTTP_RETRY_BACKOFF_SEC: float = 0.7
+
 settings = Settings()
