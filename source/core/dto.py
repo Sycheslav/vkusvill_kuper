@@ -13,7 +13,8 @@ class Task(BaseModel):
     limit: Optional[int] = 500
     city: str = "москва"      
     user_id: int              
-    chat_id: int             
+    chat_id: int
+    result_key: Optional[str] = None  # Ключ для записи результата в Redis
 
 class ProductID(BaseModel):
     product_id: str
@@ -33,7 +34,8 @@ class ProductDetail(BaseModel):
     photos: List[str] = []
     category: str
     store: Optional[str] = None
-    in_stock: bool = True  
+    in_stock: bool = True
+    url: Optional[str] = None  # Ссылка на продукт
 
 class ParseResult(BaseModel):
     task_id: str
@@ -42,4 +44,6 @@ class ParseResult(BaseModel):
     products: List[ProductID | ProductDetail]
     took_seconds: float
     user_id: int
-    chat_id: int      
+    chat_id: int
+    status: str = "success"  # "success" | "error"
+    error_message: Optional[str] = None

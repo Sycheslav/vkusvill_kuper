@@ -1,9 +1,29 @@
 from async_tls_client.session.session import AsyncSession
 import logging
 
+from source.core.config import settings
+
 logger = logging.getLogger(__name__)
 
+# Дефолтные координаты (Москва)
+DEFAULT_COORDS = (55.7558, 37.6173)
+
 async def get_coords_by_city(city_name: str) -> tuple[float, float]:
+    """
+    Получить координаты города через 2GIS API.
+    
+    Args:
+        city_name: Название города или адрес
+        
+    Returns:
+        (lat, lon) - координаты
+    """
+    # Используем API ключ из настроек
+    if not settings.DGIS_API_KEY:
+        logger.warning(f"DGIS_API_KEY не задан, используем дефолтные координаты для {city_name}")
+        return DEFAULT_COORDS
+    api_key = settings.DGIS_API_KEY
+    
     session = AsyncSession(client_identifier="chrome_120", random_tls_extension_order=True)
     headers = {
         'client-id': 'KuperAndroid',
@@ -22,7 +42,7 @@ async def get_coords_by_city(city_name: str) -> tuple[float, float]:
         resp = await session.get(
             "https://catalog.api.2gis.com/3.0/suggests",
             params={
-                "key": "rutvqk5607",
+                "key": api_key,
                 "q": city_name,
                 "type": "building,street,adm_div.city",
                 "suggest_type": "address",
@@ -32,14 +52,21 @@ async def get_coords_by_city(city_name: str) -> tuple[float, float]:
             headers=headers
         )
         data = resp.json()
-        point = data.get("result", {}).get("items", [{}])[0].get("point", {})
-        lat = float(point.get("lat", 55.7558))
-        lon = float(point.get("lon", 37.6173))
-        logger.error(f"2GIS: {city_name} → {lat}, {lon}")
-
+        items = data.get("result", {}).get("items", [])
+        
+        if not items:
+            logger.warning(f"2GIS не нашел город: {city_name}, используем дефолтные координаты")
+            return DEFAULT_COORDS
+            
+        point = items[0].get("point", {})
+        lat = float(point.get("lat", DEFAULT_COORDS[0]))
+        lon = float(point.get("lon", DEFAULT_COORDS[1]))
+        
+        logger.info(f"2GIS: {city_name} → {lat}, {lon}")
         return lat, lon
+        
     except Exception as e:
         logger.error(f"2GIS ошибка для {city_name}: {e}")
-        return 55.7558, 37.6173
+        return DEFAULT_COORDS
     finally:
         await session.close()

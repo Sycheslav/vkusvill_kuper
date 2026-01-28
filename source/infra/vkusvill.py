@@ -57,7 +57,9 @@ class VkusvillParser(BaseParser):
             lat, lon = settings.VKUSVILL_CITY_COORDS[key]
         
         if lat is None or lon is None:
-            raise ValueError(...)
+            default_coords = settings.VKUSVILL_CITY_COORDS.get("москва", (55.7558, 37.6173))
+            logger.warning("Не удалось определить координаты для %s, используем дефолтные: %s", city_input, default_coords)
+            lat, lon = default_coords
 
         if settings.VKUSVILL_PROXY_LIST:
             proxy = await self._checkout_proxy(r)
@@ -132,7 +134,7 @@ class VkusvillParser(BaseParser):
                 'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[AddressesFragmentV2]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-25]}{[def_id_service]}{[3]}{[def_type_service]}{[3]}{[def_gettype]}{[0]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[2284]}{[def_slot_during]}{[null]}{[def_slot_since]}{[10:00:00]}{[def_slot_until]}{[12:00:00]}{[user_number]}{[&]ё4464]}{[ts]}{[1729705163318]}{[method]}{[/api/takeaway/updCartHeader/]}',
             }
             await session.post(f"{self.BASE_URL}/takeaway/updCartHeader/", json=data, headers=self.HEADERS)
-            logger.error(f"ВкусВилл: гео {city_input} | прокси: {'да' if proxy else 'нет'}")
+            logger.info("ВкусВилл: гео %s | прокси: %s", city_input, "да" if proxy else "нет")
         except Exception as e:
             logger.error(f"Ошибка установки гео ВкусВилл {city_input}: {e}")
 
@@ -177,7 +179,7 @@ class VkusvillParser(BaseParser):
             }
 
             resp = await session.get(f"{self.BASE_URL}/bff/get_screen_widgets", params=params, headers=self.HEADERS)
-            logger.error(f"widgets {resp}")
+            logger.debug("widgets %s", resp)
             widgets = resp.json().get("widgets", [])
 
             tasks = []
@@ -250,7 +252,7 @@ class VkusvillParser(BaseParser):
                     params=params,
                     headers=self.HEADERS
                 )
-                logger.error(f"page_resp fast {resp} {offset} {limit} {cat_id}")
+                logger.debug("page_resp fast %s %s %s %s", resp, offset, limit, cat_id)
                 
                 data = resp.json()
 
@@ -268,6 +270,7 @@ class VkusvillParser(BaseParser):
                     price = current_price_cents
                     old_price = base_price_cents if base_price_cents > current_price_cents else None
                     weight = item.get("weight_str")
+                    url = self._extract_url(item)
                     amount = item.get("amount", 0) or item.get("amount_express", 0) 
                     in_stock = bool(amount > 0)
 
@@ -304,7 +307,8 @@ class VkusvillParser(BaseParser):
                         photos=photos,
                         category=category,
                         store="ВкусВилл",
-                        in_stock=in_stock
+                        in_stock=in_stock,
+                        url=url
                     ))
 
                 page += 1
@@ -327,6 +331,19 @@ class VkusvillParser(BaseParser):
             return float(value) if value else None
         except ValueError:
             return None
+
+    def _extract_url(self, obj: dict) -> Optional[str]:
+        """Пытается извлечь URL товара из ответа API."""
+        if not isinstance(obj, dict):
+            return None
+        for key in ("url", "link", "product_url", "web_url", "share_url"):
+            value = obj.get(key)
+            if value:
+                return value
+        slug = obj.get("slug") or obj.get("code") or obj.get("product_slug")
+        if slug:
+            return f"https://vkusvill.ru/goods/{slug}.html"
+        return None
 
     async def parse_heavy(self, task: Task, r: redis.Redis) -> ParseResult:
         start = time.time()
@@ -387,7 +404,7 @@ class VkusvillParser(BaseParser):
                         params=params,
                         headers=self.HEADERS
                     )
-                    logger.error(f"page_resp {page_resp} {offset}")
+                    logger.debug("page_resp %s %s", page_resp, offset)
                     
                     data = page_resp.json()
                     
@@ -447,13 +464,19 @@ class VkusvillParser(BaseParser):
                             weight = pr.get("weight_str") or f"{pr.get('weight_kg', 0) * 1000:.0f} г"
                             amount = pr.get("amount", 0) or pr.get("amount_express", 0)
                             in_stock = bool(amount > 0)
+                            url = self._extract_url(pr)
+
+                            price_obj = pr.get("price", {})
+                            current_price_cents = price_obj.get("discount_price") or price_obj.get("price", 0)
+                            base_price_cents = price_obj.get("price", 0)
+                            price = current_price_cents
+                            old_price = base_price_cents if base_price_cents > current_price_cents else None
 
                             detailed.append(ProductDetail(
                                 product_id=pid,
                                 name=pr.get("title", ""),
-                                price=pr.get("price", {}).get("price", 0) ,  
-                                old_price=pr.get("price", {}).get("discount_price", 0) 
-                                        if pr.get("price", {}).get("discount_percent", 0) > 0 else None,
+                                price=price,
+                                old_price=old_price,
                                 calories=calories,
                                 proteins=proteins,
                                 fats=fats,
@@ -463,7 +486,8 @@ class VkusvillParser(BaseParser):
                                 photos=photos[:10], 
                                 category=title,
                                 store="ВкусВилл",
-                                in_stock=in_stock
+                                in_stock=in_stock,
+                                url=url
                             ))
 
 

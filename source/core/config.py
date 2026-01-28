@@ -1,6 +1,6 @@
 import os
 from pydantic_settings import BaseSettings
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()  
@@ -12,7 +12,7 @@ class Settings(BaseSettings):
         "extra": "ignore"
     }
 
-    TG_BOT_TOKEN: str
+    TG_BOT_TOKEN: str = ""  # Опционально, если бот парсера не используется
     REDIS_URL: str = "redis://redis:6379/0"
 
     VKUSVILL_PROXIES: str = ""
@@ -34,7 +34,21 @@ class Settings(BaseSettings):
     }
 
     DATA_DIR: str = "source/data"
+    
+    # Redis Streams
     INPUT_STREAM: str = "food_parse_tasks"
     OUTPUT_STREAM: str = "food_parse_results"
+    
+    # Новые параметры для worker
+    STREAM_MAXLEN: int = 2000  # Максимальная длина стримов
+    RESULT_TTL_SEC: int = 900  # TTL ключа результата (15 минут)
+    HEARTBEAT_TTL_SEC: int = 60  # TTL heartbeat (1 минута)
+    
+    # Consumer group
+    PARSER_GROUP: str = "food_group"
+    PARSER_CONSUMER: str = "worker-1"
+    
+    # API ключ 2GIS для геокодинга
+    DGIS_API_KEY: str = ""
 
 settings = Settings()
