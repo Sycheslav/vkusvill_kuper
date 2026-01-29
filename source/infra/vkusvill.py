@@ -6,6 +6,7 @@ import os
 import pandas as pd
 import re
 from typing import Optional
+from datetime import datetime, date
 
 import redis.asyncio as redis 
 from source.application.parser_interface import BaseParser
@@ -14,6 +15,16 @@ from source.core.config import settings
 from async_tls_client.session.session import AsyncSession
 
 logger = logging.getLogger("vkusvill_parser")
+
+
+def _get_current_date_str() -> str:
+    """Возвращает текущую дату в формате YYYY-MM-DD"""
+    return date.today().strftime("%Y-%m-%d")
+
+
+def _get_current_date_compact() -> str:
+    """Возвращает текущую дату в формате YYYYMMDD"""
+    return date.today().strftime("%Y%m%d")
 
 class VkusvillParser(BaseParser):
     BASE_URL = "https://mobile.vkusvill.ru/api"
@@ -33,6 +44,33 @@ class VkusvillParser(BaseParser):
 
     PROXY_REDIS_KEY = "vkusvill:proxies:free" 
 
+    def _mask_proxy(self, proxy: Optional[str]) -> str:
+        if not proxy:
+            return "none"
+        try:
+            scheme, rest = proxy.split("://", 1)
+            if "@" in rest:
+                _, host = rest.split("@", 1)
+                return f"{scheme}://***:***@{host}"
+            return f"{scheme}://{rest}"
+        except Exception:
+            return "<masked>"
+
+    def _summarize_params(self, params):
+        if not params:
+            return {}
+        keys = {"screen", "object_id", "offset", "limit", "sort_id", "data_source"}
+        summary = {}
+        if isinstance(params, dict):
+            for k in keys:
+                if k in params:
+                    summary[k] = params.get(k)
+        elif isinstance(params, list):
+            for k, v in params:
+                if k in keys:
+                    summary[k] = v
+        return summary
+
     async def _checkout_proxy(self, r: redis.Redis) -> Optional[str]:
         proxy = await r.lpop(self.PROXY_REDIS_KEY)
         if proxy:
@@ -42,7 +80,7 @@ class VkusvillParser(BaseParser):
     async def _checkin_proxy(self, r: redis.Redis, proxy: str):
         if proxy:
             await r.rpush(self.PROXY_REDIS_KEY, proxy)
-            logger.info("Прокси %s возвращен в очередь.", proxy)
+            logger.info("Прокси %s возвращен в очередь.", self._mask_proxy(proxy))
 
     async def _request_json(
         self,
@@ -59,16 +97,57 @@ class VkusvillParser(BaseParser):
 
         for attempt in range(retries + 1):
             try:
+                started = time.monotonic()
+                logger.info(
+                    "VV HTTP GET start | url=%s | attempt=%s/%s | timeout=%ss | params=%s",
+                    url.replace(self.BASE_URL, ""),
+                    attempt + 1,
+                    retries + 1,
+                    timeout,
+                    self._summarize_params(params),
+                )
                 resp = await session.get(url, params=params, headers=headers, timeout=timeout)
                 status = getattr(resp, "status", None)
                 if status and status != 200:
                     raise ValueError(f"HTTP {status}")
+                elapsed = time.monotonic() - started
+                logger.info(
+                    "VV HTTP GET ok | url=%s | status=%s | elapsed=%.2fs",
+                    url.replace(self.BASE_URL, ""),
+                    status,
+                    elapsed,
+                )
                 return resp.json()
             except Exception as e:
+                elapsed = time.monotonic() - started
                 if attempt >= retries:
-                    logger.warning("Vkusvill request failed: %s", e)
+                    logger.warning(
+                        "VV HTTP GET failed | url=%s | attempt=%s/%s | elapsed=%.2fs | error=%s",
+                        url.replace(self.BASE_URL, ""),
+                        attempt + 1,
+                        retries + 1,
+                        elapsed,
+                        e,
+                    )
                     return None
+                logger.info(
+                    "VV HTTP GET retry | url=%s | attempt=%s/%s | elapsed=%.2fs | error=%s",
+                    url.replace(self.BASE_URL, ""),
+                    attempt + 1,
+                    retries + 1,
+                    elapsed,
+                    e,
+                )
                 await asyncio.sleep(backoff * (attempt + 1))
+
+    async def _close_session(self, session: Optional[AsyncSession]):
+        """Закрыть сессию безопасно"""
+        if session:
+            try:
+                await session.close()
+                logger.debug("VkusVill сессия закрыта")
+            except Exception as e:
+                logger.warning("Ошибка закрытия сессии VkusVill: %s", e)
 
     async def _get_session_for_city(self, city_input: str, r: redis.Redis) -> tuple[AsyncSession, Optional[str]]:
         key = city_input.strip().lower()
@@ -91,8 +170,13 @@ class VkusvillParser(BaseParser):
             proxy = await self._checkout_proxy(r)
             if not proxy:
                 logger.warning("Нет свободных прокси в очереди. Используется прямое подключение (IP может быть занят).")
-            
-        logger.info(f"ВкусВилл Setup | Geo: {lat},{lon} | Proxy: {proxy if proxy else 'Direct'}")
+        logger.info(
+            "ВкусВилл Setup | city=%s | geo=%s,%s | proxy=%s",
+            city_input,
+            lat,
+            lon,
+            self._mask_proxy(proxy),
+        )
         
         session = AsyncSession(
             client_identifier="chrome_120",
@@ -100,6 +184,11 @@ class VkusvillParser(BaseParser):
         )
         if proxy:
             session.proxies = {"http": proxy, "https": proxy}
+
+        # Используем динамические даты
+        current_date = _get_current_date_str()
+        current_date_compact = _get_current_date_compact()
+        ts = str(int(time.time() * 1000))
 
         try:
             params = {
@@ -127,21 +216,29 @@ class VkusvillParser(BaseParser):
                 'with_ice': '0',
                 'with_wine': '0',
                 'with_help_animals': '0',
-                'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[ShopAddressesFragmentV2]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-23]}{[def_id_service]}{[3]}{[def_type_service]}{[3]}{[def_gettype]}{[0]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[6516]}{[def_slot_during]}{[null]}{[def_slot_since]}{[18:00:00]}{[def_slot_until]}{[20:00:00]}{[user_number]}{[&]ё4464]}{[ts]}{[1729691867108]}{[method]}{[/api/stores/getNearbyNew/]}',
+                'str_par': f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[ShopAddressesFragmentV2]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[3]}}{{[def_type_service]}}{{[3]}}{{[def_gettype]}}{{[0]}}{{[def_Number_button]}}{{[null]}}{{[def_ShopNo]}}{{[6516]}}{{[def_slot_during]}}{{[null]}}{{[def_slot_since]}}{{[18:00:00]}}{{[def_slot_until]}}{{[20:00:00]}}{{[user_number]}}{{[&]ё4464]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/stores/getNearbyNew/]}}',
             }
+            logger.info("VkusVill: запрос ближайших магазинов...")
             resp = await session.get(
                 f"{self.BASE_URL}/stores/getNearbyNew/",
                 params=params,
                 headers=self.HEADERS,
                 timeout=settings.HTTP_TIMEOUT_SEC
             )
-            result = resp.json().get("stores")[0]
+            stores_data = resp.json()
+            stores = stores_data.get("stores", [])
+            if not stores:
+                logger.error("VkusVill: не найдены магазины для координат %s, %s", lat, lon)
+                return session, proxy
+            
+            result = stores[0]
             shopno = result.get("ShopNo")
+            logger.info("VkusVill: найден магазин ShopNo=%s", shopno)
         
             params = {
                 'number': '&]ё4464',
                 'shopNo': str(shopno),
-                'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[ShopAddressesFragmentV2]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-25]}{[def_id_service]}{[3]}{[def_type_service]}{[3]}{[def_gettype]}{[0]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[7660]}{[def_slot_during]}{[null]}{[def_slot_since]}{[11:00:00]}{[def_slot_until]}{[13:00:00]}{[user_number]}{[&]ё4464]}{[ts]}{[1729704763853]}{[method]}{[/api/takeaway/addPickupAddresses/]}',
+                'str_par': f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[ShopAddressesFragmentV2]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[3]}}{{[def_type_service]}}{{[3]}}{{[def_gettype]}}{{[0]}}{{[def_Number_button]}}{{[null]}}{{[def_ShopNo]}}{{[{shopno}]}}{{[def_slot_during]}}{{[null]}}{{[def_slot_since]}}{{[11:00:00]}}{{[def_slot_until]}}{{[13:00:00]}}{{[user_number]}}{{[&]ё4464]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/takeaway/addPickupAddresses/]}}',
             }
 
             await session.get(
@@ -153,7 +250,7 @@ class VkusvillParser(BaseParser):
             data = {
                 'number': '&]ё4464',
                 'shopNo': str(shopno),
-                'DateSupply': '20241025',
+                'DateSupply': current_date_compact,
                 'number_button_chosen': '1',
                 'id_service_chosen': '3',
                 'gettype': '0',
@@ -163,7 +260,7 @@ class VkusvillParser(BaseParser):
                 'price_delivery': '0.0',
                 'not_need_slots': '0',
                 'package_id': '0',
-                'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[AddressesFragmentV2]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-25]}{[def_id_service]}{[3]}{[def_type_service]}{[3]}{[def_gettype]}{[0]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[2284]}{[def_slot_during]}{[null]}{[def_slot_since]}{[10:00:00]}{[def_slot_until]}{[12:00:00]}{[user_number]}{[&]ё4464]}{[ts]}{[1729705163318]}{[method]}{[/api/takeaway/updCartHeader/]}',
+                'str_par': f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[AddressesFragmentV2]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[3]}}{{[def_type_service]}}{{[3]}}{{[def_gettype]}}{{[0]}}{{[def_Number_button]}}{{[null]}}{{[def_ShopNo]}}{{[{shopno}]}}{{[def_slot_during]}}{{[null]}}{{[def_slot_since]}}{{[10:00:00]}}{{[def_slot_until]}}{{[12:00:00]}}{{[user_number]}}{{[&]ё4464]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/takeaway/updCartHeader/]}}',
             }
             await session.post(
                 f"{self.BASE_URL}/takeaway/updCartHeader/",
@@ -171,9 +268,9 @@ class VkusvillParser(BaseParser):
                 headers=self.HEADERS,
                 timeout=settings.HTTP_TIMEOUT_SEC
             )
-            logger.info("ВкусВилл: гео %s | прокси: %s", city_input, "да" if proxy else "нет")
+            logger.info("ВкусВилл: гео настроено | city=%s | shopno=%s | proxy=%s", city_input, shopno, self._mask_proxy(proxy))
         except Exception as e:
-            logger.error(f"Ошибка установки гео ВкусВилл {city_input}: {e}")
+            logger.error("Ошибка установки гео ВкусВилл %s: %s", city_input, e, exc_info=True)
 
         return session, proxy
     
@@ -193,7 +290,10 @@ class VkusvillParser(BaseParser):
     async def parse_fast(self, task: Task, r: redis.Redis) -> ParseResult:
         start = time.time()
         products = []
+        session = None
+        current_proxy = None
 
+        logger.info("Vkusvill fast start | task_id=%s | city=%s | limit=%s", task.task_id, task.city, task.limit)
         try:
             limit = int(task.limit) if task.limit else 500
         except (TypeError, ValueError):
@@ -204,15 +304,22 @@ class VkusvillParser(BaseParser):
 
         city = task.city.strip().lower() or "москва"
         session, current_proxy = await self._get_session_for_city(task.city, r)
+        logger.info("Vkusvill fast | лимит=%s | прокси=%s", limit, self._mask_proxy(current_proxy))
 
-        heavy_df = None
+        # Загрузка кэша с конвертацией в dict для O(1) lookup
+        heavy_dict = None
         if os.path.exists(self.HEAVY_CSV_PATH):
             try:
                 heavy_df = pd.read_csv(self.HEAVY_CSV_PATH, sep=";", dtype=str, keep_default_na=False)
                 heavy_df["product_id"] = heavy_df["product_id"].str.strip()
-                logger.info("Vkusvill fast | кэш загружен: %d товаров", len(heavy_df))
+                heavy_dict = heavy_df.set_index("product_id").to_dict("index")
+                logger.info("Vkusvill fast | кэш загружен: %d товаров", len(heavy_dict))
             except Exception as e:
                 logger.error("Ошибка чтения heavy CSV: %s", e)
+
+        # Динамические параметры
+        current_date = _get_current_date_str()
+        ts = str(int(time.time() * 1000))
 
         try:
             params = {
@@ -220,9 +327,10 @@ class VkusvillParser(BaseParser):
                 'number': '&_5>527',
                 'offline': '0',
                 'all_products': 'false',
-                'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-10]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[56]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[6098]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1728539006506]}{[method]}{[/api/bff/get_screen_widgets]}',
+                'str_par': f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[CatalogFragment]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[32]}}{{[def_type_service]}}{{[1]}}{{[def_gettype]}}{{[56]}}{{[def_Number_button]}}{{[null]}}{{[def_ShopNo]}}{{[6098]}}{{[def_slot_during]}}{{[01:00:00]}}{{[def_slot_since]}}{{[null]}}{{[def_slot_until]}}{{[null]}}{{[user_number]}}{{[&_5>527]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/bff/get_screen_widgets]}}',
             }
 
+            logger.info("Vkusvill fast | запрашиваем widgets для каталога")
             data = await self._request_json(
                 session,
                 f"{self.BASE_URL}/bff/get_screen_widgets",
@@ -230,6 +338,7 @@ class VkusvillParser(BaseParser):
                 headers=self.HEADERS,
             )
             widgets = data.get("widgets", []) if isinstance(data, dict) else []
+            logger.info("Vkusvill fast | widgets получено: %d", len(widgets))
 
             tasks = []
             
@@ -247,13 +356,13 @@ class VkusvillParser(BaseParser):
                         if not cat_id:
                             continue
                         
-                        logger.info(f"Найдена категория: {title} (ID: {cat_id})")
+                        logger.info("Vkusvill fast | категория: %s | id=%s", title, cat_id)
                         tasks.append(
                             self._fetch_category_fast(
                                 session,
                                 str(cat_id),
                                 title,
-                                heavy_df,
+                                heavy_dict,
                                 products,
                                 limit,
                                 stop_event
@@ -261,22 +370,26 @@ class VkusvillParser(BaseParser):
                         )
             
             if not tasks:
-                 logger.warning("Не найдена категория 'Готовая еда' в виджетах")
+                logger.warning("Vkusvill fast | не найдена категория 'Готовая еда' в виджетах")
 
             if tasks:
+                logger.info("Vkusvill fast | задач для категорий: %d", len(tasks))
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             logger.error("Vkusvill fast fatal error: %s", e, exc_info=True)
         finally:
+            # Возвращаем прокси в очередь
             if current_proxy:
                 await self._checkin_proxy(r, current_proxy)
+            # Закрываем сессию
+            await self._close_session(session)
 
         if limit and len(products) > limit:
             products = products[:limit]
 
         took = round(time.time() - start, 1)
-        logger.info("Vkusvill fast завершён | товаров: %d | время: %.1fс | кэш: %s", len(products), took, "ДА" if heavy_df is not None else "НЕТ")
+        logger.info("Vkusvill fast завершён | товаров: %d | время: %.1fс | кэш: %s", len(products), took, "ДА" if heavy_dict is not None else "НЕТ")
 
         return ParseResult(
             task_id=task.task_id,
@@ -293,13 +406,18 @@ class VkusvillParser(BaseParser):
         session,
         cat_id: str,
         category: str,
-        heavy_df,
+        heavy_dict: Optional[dict],
         result_list: list,
         max_products: int,
         stop_event: asyncio.Event
     ):
         page_limit = 24
         page = 1
+        logger.info("Vkusvill fast | старт категории=%s id=%s", category, cat_id)
+        
+        # Динамические параметры
+        current_date = _get_current_date_str()
+        ts = str(int(time.time() * 1000))
         
         while True:
             if stop_event.is_set():
@@ -320,10 +438,16 @@ class VkusvillParser(BaseParser):
                 ('limit', str(page_limit)),
                 ('offline', '0'),
                 ('all_products', 'false'),
-                ('str_par', '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogMainFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-18]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[4]}{[def_Number_button]}{[1]}{[def_ShopNo]}{[3700]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1729253880342]}{[method]}{[/api/bff/get_widget_content]}'),
+                ('str_par', f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[CatalogMainFragment]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[32]}}{{[def_type_service]}}{{[1]}}{{[def_gettype]}}{{[4]}}{{[def_Number_button]}}{{[1]}}{{[def_ShopNo]}}{{[3700]}}{{[def_slot_during]}}{{[01:00:00]}}{{[def_slot_since]}}{{[null]}}{{[def_slot_until]}}{{[null]}}{{[user_number]}}{{[&_5>527]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/bff/get_widget_content]}}'),
             ]
 
             try:
+                logger.info(
+                    "Vkusvill fast | category=%s | page=%s | offset=%s",
+                    category,
+                    page,
+                    offset,
+                )
                 data = await self._request_json(
                     session,
                     f"{self.BASE_URL}/bff/get_widget_content",
@@ -332,7 +456,13 @@ class VkusvillParser(BaseParser):
                 )
 
                 if not data or not isinstance(data, list):
+                    logger.info("Vkusvill fast | category=%s | нет больше данных", category)
                     break
+                logger.info(
+                    "Vkusvill fast | category=%s | items=%d",
+                    category,
+                    len(data),
+                )
 
                 for item in data:
                     if stop_event.is_set():
@@ -356,18 +486,19 @@ class VkusvillParser(BaseParser):
                     if large_images_obj:
                         photos = [img.get("url", "") for img in large_images_obj.get("images", []) if img.get("url")]
 
+                    # O(1) lookup в dict вместо O(n) в DataFrame
                     calories = proteins = fats = carbs = ingredients = None
-                    if heavy_df is not None:
-                        match = heavy_df[heavy_df["product_id"] == pid]
-                        if not match.empty:
-                            r = match.iloc[0]
-                            calories = r.get("calories")
-                            proteins = r.get("proteins")
-                            fats = r.get("fats")
-                            carbs = r.get("carbs")
-                            ingredients = r.get("ingredients")
-                            name = r.get("name", name)
-                            photos = r.get("photos", "").split(" | ") if pd.notna(r.get("photos")) else photos
+                    if heavy_dict and pid in heavy_dict:
+                        cached = heavy_dict[pid]
+                        calories = cached.get("calories")
+                        proteins = cached.get("proteins")
+                        fats = cached.get("fats")
+                        carbs = cached.get("carbs")
+                        ingredients = cached.get("ingredients")
+                        name = cached.get("name") or name
+                        cached_photos = cached.get("photos", "")
+                        if cached_photos and isinstance(cached_photos, str):
+                            photos = cached_photos.split(" | ")
 
                     result_list.append(ProductDetail(
                         product_id=pid,
@@ -394,7 +525,7 @@ class VkusvillParser(BaseParser):
                 page += 1
 
             except Exception as e:
-                logger.warning(f"Ошибка страницы {page} (offset {offset}) категории {category}: {e}")
+                logger.warning("Ошибка страницы %d (offset %d) категории %s: %s", page, offset, category, e)
                 break
     
     def _parse_nutrient_value(self, match) -> Optional[float]:
@@ -432,6 +563,10 @@ class VkusvillParser(BaseParser):
         current_proxy = None
 
         session, current_proxy = await self._get_session_for_city(task.city, r)
+        
+        # Динамические параметры
+        current_date = _get_current_date_str()
+        ts = str(int(time.time() * 1000))
 
         try:
             params = {
@@ -439,8 +574,9 @@ class VkusvillParser(BaseParser):
                 'number': '&_5>527',
                 'offline': '0',
                 'all_products': 'false',
-                'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-10]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[56]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[6098]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1728539006506]}{[method]}{[/api/bff/get_screen_widgets]}',
+                'str_par': f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[CatalogFragment]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[32]}}{{[def_type_service]}}{{[1]}}{{[def_gettype]}}{{[56]}}{{[def_Number_button]}}{{[null]}}{{[def_ShopNo]}}{{[6098]}}{{[def_slot_during]}}{{[01:00:00]}}{{[def_slot_since]}}{{[null]}}{{[def_slot_until]}}{{[null]}}{{[user_number]}}{{[&_5>527]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/bff/get_screen_widgets]}}',
             }
+            logger.info("Vkusvill heavy | запрашиваем widgets для каталога")
             data = await self._request_json(
                 session,
                 f"{self.BASE_URL}/bff/get_screen_widgets",
@@ -448,6 +584,7 @@ class VkusvillParser(BaseParser):
                 headers=self.HEADERS,
             )
             widgets = data.get("widgets", []) if isinstance(data, dict) else []
+            logger.info("Vkusvill heavy | widgets: %d", len(widgets))
             
             categories_to_parse = []
             for widget in widgets:
@@ -464,10 +601,13 @@ class VkusvillParser(BaseParser):
 
             if not categories_to_parse:
                 logger.warning("Не найдена категория 'Готовая еда' для heavy парсинга.")
-            logger.warning(categories_to_parse)
+            else:
+                logger.info("Vkusvill heavy | найдено категорий: %d", len(categories_to_parse))
+                
             for cat_id, title in categories_to_parse:
                 limit = 24
                 page = 1
+                logger.info("Vkusvill heavy | парсим категорию: %s (id=%s)", title, cat_id)
                 while True:
                     offset = (page - 1) * limit
                     
@@ -481,7 +621,7 @@ class VkusvillParser(BaseParser):
                         ('limit', str(limit)),
                         ('offline', '0'),
                         ('all_products', 'false'),
-                        ('str_par', '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[CatalogMainFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-18]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[4]}{[def_Number_button]}{[1]}{[def_ShopNo]}{[3700]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1729253880342]}{[method]}{[/api/bff/get_widget_content]}'),
+                        ('str_par', f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[CatalogMainFragment]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[32]}}{{[def_type_service]}}{{[1]}}{{[def_gettype]}}{{[4]}}{{[def_Number_button]}}{{[1]}}{{[def_ShopNo]}}{{[3700]}}{{[def_slot_during]}}{{[01:00:00]}}{{[def_slot_since]}}{{[null]}}{{[def_slot_until]}}{{[null]}}{{[user_number]}}{{[&_5>527]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/bff/get_widget_content]}}'),
                     ]
 
                     data = await self._request_json(
@@ -494,29 +634,31 @@ class VkusvillParser(BaseParser):
                     if not data:
                         break
 
+                    logger.info("Vkusvill heavy | category=%s | page=%d | items=%d", title, page, len(data))
+
                     for item in data:
                         if item.get("type") and item.get("type") != "product":
                             continue
 
                         pid = str(item["id"])
                         try:
-                            params = {
+                            card_params = {
                                 'number': '&_5>527',
                                 'source': '2',
                                 'version': '311006',
                                 'product_id': pid,
                                 'shopno': '0',
                                 'offline': '0',
-                                'str_par': '{[version]}{[311006]}{[device_model]}{[V2339A]}{[screen_id]}{[ProductFragment]}{[source]}{[2]}{[device_id]}{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}{[def_Date_service]}{[2024-10-10]}{[def_id_service]}{[32]}{[def_type_service]}{[1]}{[def_gettype]}{[56]}{[def_Number_button]}{[null]}{[def_ShopNo]}{[6098]}{[def_slot_during]}{[01:00:00]}{[def_slot_since]}{[null]}{[def_slot_until]}{[null]}{[user_number]}{[&_5>527]}{[ts]}{[1728539918115]}{[method]}{[/api/catalog4/product]}',
+                                'str_par': f'{{[version]}}{{[311006]}}{{[device_model]}}{{[V2339A]}}{{[screen_id]}}{{[ProductFragment]}}{{[source]}}{{[2]}}{{[device_id]}}{{[15bad36a-71b8-46d9-9c3a-8aaed80bca46]}}{{[def_Date_service]}}{{[{current_date}]}}{{[def_id_service]}}{{[32]}}{{[def_type_service]}}{{[1]}}{{[def_gettype]}}{{[56]}}{{[def_Number_button]}}{{[null]}}{{[def_ShopNo]}}{{[6098]}}{{[def_slot_during]}}{{[01:00:00]}}{{[def_slot_since]}}{{[null]}}{{[def_slot_until]}}{{[null]}}{{[user_number]}}{{[&_5>527]}}{{[ts]}}{{[{ts}]}}{{[method]}}{{[/api/catalog4/product]}}',
                                 }
                             card_resp = await session.get(
                                 f"{self.BASE_URL}/catalog4/product",
-                                params=params, 
+                                params=card_params, 
                                 headers=self.HEADERS,
                                 timeout=15
                             )
                             if card_resp.status != 200:
-                                logger.warning(f"Карточка {pid} вернула {card_resp.status}")
+                                logger.warning("Карточка %s вернула %s", pid, card_resp.status)
                                 continue
 
                             pr = card_resp.json() 
@@ -582,8 +724,11 @@ class VkusvillParser(BaseParser):
         except Exception as e:
             logger.error("Vkusvill heavy fatal error: %s", e, exc_info=True)
         finally:
+            # Возвращаем прокси в очередь
             if current_proxy:
                 await self._checkin_proxy(r, current_proxy)
+            # Закрываем сессию
+            await self._close_session(session)
 
         if detailed:
             df = pd.DataFrame([{
@@ -605,12 +750,15 @@ class VkusvillParser(BaseParser):
             df.to_csv(self.HEAVY_CSV_PATH, sep=";", index=False, encoding="utf-8-sig")
             logger.info("Vkusvill HEAVY кэш сохранён: %d товаров", len(df))
 
+        took = round(time.time() - start, 1)
+        logger.info("Vkusvill heavy завершён | товаров=%d | время=%.1fs", len(detailed), took)
+
         return ParseResult(
             task_id=task.task_id,
             service="vkusvill",
             mode="heavy",
             products=detailed,
-            took_seconds=round(time.time() - start, 1),
+            took_seconds=took,
             user_id=task.user_id,
             chat_id=task.chat_id
         )

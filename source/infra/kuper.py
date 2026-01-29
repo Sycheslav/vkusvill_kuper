@@ -6,6 +6,8 @@ import random
 import os
 import pandas as pd
 
+import redis.asyncio as redis
+
 from source.application.parser_interface import BaseParser
 from source.core.dto import Task, ParseResult, ProductID, ProductDetail
 from source.infra.tls_client import TLSClient
@@ -33,28 +35,51 @@ class KuperParser(BaseParser):
             'screenname': 'MultiRetailSearch',
         }
     
-    session = AsyncSession(
+    def __init__(self):
+        self._session: Optional[AsyncSession] = None
+    
+    def _create_session(self) -> AsyncSession:
+        """Создать новую сессию"""
+        return AsyncSession(
             client_identifier="chrome_120",
             random_tls_extension_order=True
         )
     
-    @property
-    def heavy_csv_path(self) -> str:
-        store = (getattr(self, "current_store", "") or "unknown").lower()
+    async def _close_session(self):
+        """Закрыть текущую сессию"""
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception as e:
+                logger.warning("Ошибка закрытия сессии Kuper: %s", e)
+            finally:
+                self._session = None
+    
+    def _get_heavy_csv_path(self, store_name: str) -> str:
+        """Получить путь к кэш-файлу для магазина"""
+        store = (store_name or "unknown").lower().replace(" ", "_")
         return f"{settings.DATA_DIR}/kuper_heavy_{store}.csv"
 
-    current_store: str = ""
+    def _summarize_params(self, params: Optional[dict]) -> dict:
+        if not params:
+            return {}
+        keys = {"sid", "tid", "limit", "products_offset", "sort", "lat", "lon", "shipping_method"}
+        return {k: params.get(k) for k in keys if k in params}
 
-    async def _get_store_id(self, lat, lon, store_name: str) -> str:
+    async def _get_store_id(self, lat, lon, store_name: str) -> Optional[tuple]:
         params = {'shipping_method': 'by_courier', 'lat': str(lat), 'lon': str(lon), 'include_labels_tree': 'true'}
         data = await self._request_json(f"{self.BASE_URL}/stores", params=params, headers=self.HEADERS)
         stores = data.get("stores", []) if isinstance(data, dict) else []
         if not stores:
+            logger.warning("Kuper API не вернул список магазинов для координат %s, %s", lat, lon)
             return None
         store_key = store_name.lower()
         for store in stores:
             if store_key in store.get("name", "").lower():
+                logger.info("Найден магазин: %s (id=%s)", store.get("name"), store["id"])
                 return (store["id"], store.get("name", ""))
+        # Если точное совпадение не найдено, берём первый
+        logger.info("Точное совпадение не найдено для '%s', используем первый магазин: %s", store_name, stores[0].get("name"))
         return (stores[0]["id"], stores[0]["name"]) if stores else None
 
     def _parse_nutrient(self, value: str) -> Optional[float]:
@@ -84,35 +109,91 @@ class KuperParser(BaseParser):
         headers: Optional[dict] = None,
         timeout: Optional[int] = None,
     ):
+        if not self._session:
+            raise RuntimeError("Session not initialized. Call parse() first.")
+        
         timeout = timeout or settings.HTTP_TIMEOUT_SEC
         retries = max(settings.HTTP_RETRIES, 0)
         backoff = max(settings.HTTP_RETRY_BACKOFF_SEC, 0)
 
         for attempt in range(retries + 1):
+            started = time.monotonic()
             try:
-                resp = await self.session.get(url, params=params, headers=headers, timeout=timeout)
+                logger.info(
+                    "Kuper HTTP GET start | url=%s | attempt=%s/%s | timeout=%ss | params=%s",
+                    url.replace(self.BASE_URL, ""),
+                    attempt + 1,
+                    retries + 1,
+                    timeout,
+                    self._summarize_params(params),
+                )
+                resp = await self._session.get(url, params=params, headers=headers, timeout=timeout)
                 status = getattr(resp, "status", None)
+                
+                # Обработка rate limiting
+                if status == 429:
+                    retry_after = int(resp.headers.get("Retry-After", backoff * (attempt + 2)))
+                    logger.warning("Kuper rate limited (429), waiting %ds...", retry_after)
+                    await asyncio.sleep(retry_after)
+                    continue
+                    
                 if status and status != 200:
                     raise ValueError(f"HTTP {status}")
+                elapsed = time.monotonic() - started
+                logger.info(
+                    "Kuper HTTP GET ok | url=%s | status=%s | elapsed=%.2fs",
+                    url.replace(self.BASE_URL, ""),
+                    status,
+                    elapsed,
+                )
                 return resp.json()
             except Exception as e:
+                elapsed = time.monotonic() - started
                 if attempt >= retries:
-                    logger.warning("Kuper request failed: %s", e)
+                    logger.warning(
+                        "Kuper HTTP GET failed | url=%s | attempt=%s/%s | elapsed=%.2fs | error=%s",
+                        url.replace(self.BASE_URL, ""),
+                        attempt + 1,
+                        retries + 1,
+                        elapsed,
+                        e,
+                    )
                     return None
+                logger.info(
+                    "Kuper HTTP GET retry | url=%s | attempt=%s/%s | elapsed=%.2fs | error=%s",
+                    url.replace(self.BASE_URL, ""),
+                    attempt + 1,
+                    retries + 1,
+                    elapsed,
+                    e,
+                )
                 await asyncio.sleep(backoff * (attempt + 1))
     
-    async def parse(self, task: Task) -> ParseResult:
+    async def parse(self, task: Task, redis_client: Optional[redis.Redis] = None) -> ParseResult:
         if task.mode == "fast":
-            return await self.parse_fast(task)
+            return await self.parse_fast(task, redis_client)
         elif task.mode == "heavy":
-            return await self.parse_heavy(task)
+            return await self.parse_heavy(task, redis_client)
         else:
             raise ValueError(f"Unknown mode: {task.mode}")
 
-    async def parse_fast(self, task: Task) -> ParseResult:
+    async def parse_fast(self, task: Task, redis_client: Optional[redis.Redis] = None) -> ParseResult:
             start = time.time()
             products = []
-            self.current_store = (task.store or "лента").lower().strip()
+            # Локальная переменная вместо атрибута класса (fix race condition)
+            current_store = (task.store or "лента").lower().strip()
+            logger.info(
+                "Kuper fast start | task_id=%s | city=%s | store=%s | limit=%s",
+                task.task_id,
+                task.city,
+                current_store,
+                task.limit,
+            )
+            
+            # Создаём сессию в начале
+            self._session = self._create_session()
+            logger.info("Kuper: сессия создана")
+            
             try:
                 limit = int(task.limit) if task.limit else 500
             except (TypeError, ValueError):
@@ -124,32 +205,42 @@ class KuperParser(BaseParser):
             city_name, lat, lon = parse_city_or_coords(task.city)
             if lat is not None and lon is not None:
                 use_lat, use_lon = lat, lon
+                logger.info("Kuper fast | координаты из ввода: %s, %s", use_lat, use_lon)
             else:
-                use_lat, use_lon = await get_coords_by_city(city_name)
+                use_lat, use_lon = await get_coords_by_city(city_name, redis_client)
+                logger.info("Kuper fast | координаты из геокодинга: %s, %s", use_lat, use_lon)
 
-            logger.info("%s %s %s", city_name, lat, lon)
+            logger.info("Kuper fast | city_name=%s | parsed_lat=%s | parsed_lon=%s", city_name, lat, lon)
+            
+            # Загружаем кэш
+            heavy_csv_path = self._get_heavy_csv_path(current_store)
             heavy_df = None
-            if os.path.exists(self.heavy_csv_path):
+            heavy_dict = None  # Используем dict для O(1) lookup
+            if os.path.exists(heavy_csv_path):
                 try:
-                    heavy_df = pd.read_csv(self.heavy_csv_path, sep=";", dtype=str, keep_default_na=False)
+                    heavy_df = pd.read_csv(heavy_csv_path, sep=";", dtype=str, keep_default_na=False)
                     heavy_df["sku"] = heavy_df["sku"].str.strip()
-                    logger.info("Kuper fast | кэш загружен: %d товаров", len(heavy_df))
+                    # Конвертируем в dict для быстрого поиска
+                    heavy_dict = heavy_df.set_index("sku").to_dict("index")
+                    logger.info("Kuper fast | кэш загружен: %d товаров", len(heavy_dict))
                 except Exception as e:
                     logger.error("Ошибка чтения кэша: %s", e)
 
             try:
-                result = await self._get_store_id(use_lat, use_lon, self.current_store)
+                result = await self._get_store_id(use_lat, use_lon, current_store)
                 if not result:
-                    logger.warning("Kuper fast | магазин не найден для %s", self.current_store)
+                    logger.warning("Kuper fast | магазин не найден для %s", current_store)
                     raise ValueError("Store not found")
                 store_id, store_name = result
-                self.current_store = store_name
+                current_store = store_name
+                logger.info("Kuper fast | store_id=%s | store_name=%s", store_id, store_name)
                 taxon_data = await self._request_json(
                     f"{self.BASE_URL}/taxons",
                     params={"sid": store_id},
                     headers=self.HEADERS
                 )
                 taxons = taxon_data.get("taxons", []) if isinstance(taxon_data, dict) else []
+                logger.info("Kuper fast | taxons всего: %d", len(taxons))
 
                 tasks = []
                 for taxon in taxons:
@@ -160,22 +251,29 @@ class KuperParser(BaseParser):
                         store_id=store_id,
                         tid=taxon["id"],
                         category=name,
-                        heavy_df=heavy_df,
+                        heavy_dict=heavy_dict,
                         result=products,
                         max_products=limit,
-                        stop_event=stop_event
+                        stop_event=stop_event,
+                        store_name=current_store
                     ))
 
                 if tasks:
+                    logger.info("Kuper fast | задач для категорий: %d", len(tasks))
                     await asyncio.gather(*tasks, return_exceptions=True)
+                else:
+                    logger.warning("Kuper fast | не найдены категории 'готовая еда'")
 
             except Exception as e:
                 logger.error("Kuper fast error: %s", e, exc_info=True)
+            finally:
+                # Закрываем сессию
+                await self._close_session()
 
             took = round(time.time() - start, 1)
             if limit and len(products) > limit:
                 products = products[:limit]
-            logger.info("Kuper fast | %d товаров | %.1fс | кэш: %s", len(products), took, "ДА" if heavy_df is not None else "НЕТ")
+            logger.info("Kuper fast | %d товаров | %.1fс | кэш: %s", len(products), took, "ДА" if heavy_dict is not None else "НЕТ")
 
             return ParseResult(
                 task_id=task.task_id,
@@ -192,12 +290,14 @@ class KuperParser(BaseParser):
         store_id: str,
         tid: str,
         category: str,
-        heavy_df,
+        heavy_dict: Optional[dict],
         result: list,
         max_products: int,
-        stop_event: asyncio.Event
+        stop_event: asyncio.Event,
+        store_name: str
     ):
         offset = 0
+        logger.info("Kuper fast | старт категории=%s id=%s", category, tid)
         while True:
             if stop_event.is_set():
                 break
@@ -206,6 +306,11 @@ class KuperParser(BaseParser):
                 break
 
             params = {"sid": store_id, "tid": tid, "limit": "24", "products_offset": str(offset), "sort": "popularity"}
+            logger.info(
+                "Kuper fast | category=%s | offset=%s",
+                category,
+                offset,
+            )
             data = await self._request_json(
                 f"{self.BASE_URL}/catalog/entities",
                 params=params,
@@ -213,7 +318,9 @@ class KuperParser(BaseParser):
             )
             entities = data.get("entities", []) if isinstance(data, dict) else []
             if not entities:
+                logger.info("Kuper fast | category=%s | нет больше entities", category)
                 break
+            logger.info("Kuper fast | category=%s | entities=%d", category, len(entities))
 
             for e in entities:
                 if stop_event.is_set():
@@ -231,16 +338,15 @@ class KuperParser(BaseParser):
                 in_stock = bool(stock > 0)
                 url = self._extract_url(e)
 
+                # O(1) lookup в dict вместо O(n) в DataFrame
                 calories = proteins = fats = carbs = ingredients = None
-                if heavy_df is not None and sku:
-                    match = heavy_df[heavy_df["sku"] == sku]
-                    if not match.empty:
-                        r = match.iloc[0]
-                        calories = r.get("calories")
-                        proteins = r.get("proteins")
-                        fats = r.get("fats")
-                        carbs = r.get("carbs")
-                        ingredients = r.get("ingredients")
+                if heavy_dict and sku and sku in heavy_dict:
+                    cached = heavy_dict[sku]
+                    calories = cached.get("calories")
+                    proteins = cached.get("proteins")
+                    fats = cached.get("fats")
+                    carbs = cached.get("carbs")
+                    ingredients = cached.get("ingredients")
 
                 result.append(ProductDetail(
                     product_id=region_id,  
@@ -255,7 +361,7 @@ class KuperParser(BaseParser):
                     ingredients=ingredients,
                     photos=photos,
                     category=category,
-                    store=self.current_store.capitalize(),
+                    store=store_name.capitalize() if store_name else "Kuper",
                     in_stock=in_stock,
                     url=url
                 ))
@@ -266,10 +372,15 @@ class KuperParser(BaseParser):
 
             offset += 24
 
-    async def parse_heavy(self, task: Task) -> ParseResult:
-        self.current_store = (task.store or "лента").lower().strip()
+    async def parse_heavy(self, task: Task, redis_client: Optional[redis.Redis] = None) -> ParseResult:
+        current_store = (task.store or "лента").lower().strip()
         start = time.time()
         detailed = []
+        
+        # Создаём сессию
+        self._session = self._create_session()
+        logger.info("Kuper heavy: сессия создана")
+        
         try:
             limit = int(task.limit) if task.limit else 2000
         except (TypeError, ValueError):
@@ -282,20 +393,22 @@ class KuperParser(BaseParser):
             if lat is not None and lon is not None:
                 use_lat, use_lon = lat, lon
             else:
-                use_lat, use_lon = await get_coords_by_city(city_name)
+                use_lat, use_lon = await get_coords_by_city(city_name, redis_client)
 
-            result = await self._get_store_id(use_lat, use_lon, self.current_store)
+            result = await self._get_store_id(use_lat, use_lon, current_store)
             if not result:
-                logger.warning("Kuper heavy | магазин не найден для %s", self.current_store)
+                logger.warning("Kuper heavy | магазин не найден для %s", current_store)
                 raise ValueError("Store not found")
             store_id, store_name = result
-            self.current_store = store_name
+            current_store = store_name
+            
             taxon_data = await self._request_json(
                 f"{self.BASE_URL}/taxons",
                 params={"sid": store_id},
                 headers=self.HEADERS
             )
             taxons = taxon_data.get("taxons", []) if isinstance(taxon_data, dict) else []
+            logger.info("Kuper heavy | taxons: %d", len(taxons))
 
             cache_rows = []
 
@@ -305,6 +418,8 @@ class KuperParser(BaseParser):
                 cat_name = taxon.get("name", "")
                 if not any(kw in cat_name.lower() for kw in ["готовая еда"]):
                     continue
+                
+                logger.info("Kuper heavy | парсим категорию: %s", cat_name)
 
                 offset = 0
                 while True:
@@ -363,7 +478,7 @@ class KuperParser(BaseParser):
                             ingredients=props.get("ingredients") or data.get("description", ""),
                             photos=[img.get("original_url", "") for img in data.get("images", []) if img.get("original_url")],
                             category=cat_name,
-                            store=self.current_store.capitalize(),
+                            store=current_store.capitalize() if current_store else "Kuper",
                             in_stock=in_stock,
                             url=url
                         )
@@ -379,18 +494,25 @@ class KuperParser(BaseParser):
                         })
 
                     offset += 24
+                    logger.info("Kuper heavy | category=%s | offset=%d | products=%d", cat_name, offset, len(detailed))
 
             if cache_rows:
                 cache_df = pd.DataFrame(cache_rows)
                 cache_df.drop_duplicates(subset=["sku"], keep="last", inplace=True)
                 os.makedirs(settings.DATA_DIR, exist_ok=True)
-                cache_df.to_csv(self.heavy_csv_path, sep=";", index=False, encoding="utf-8-sig")
-                logger.info("HEAVY кэш сохранён по SKU: %s | %d товаров", self.heavy_csv_path, len(cache_df))
+                heavy_csv_path = self._get_heavy_csv_path(current_store)
+                cache_df.to_csv(heavy_csv_path, sep=";", index=False, encoding="utf-8-sig")
+                logger.info("HEAVY кэш сохранён по SKU: %s | %d товаров", heavy_csv_path, len(cache_df))
 
         except Exception as e:
             logger.error("Kuper heavy fatal error: %s", e, exc_info=True)
+        finally:
+            # Закрываем сессию
+            await self._close_session()
 
         took = round(time.time() - start, 1)
+        logger.info("Kuper heavy завершён | товаров=%d | время=%.1fs", len(detailed), took)
+        
         return ParseResult(
             task_id=task.task_id,
             service="kuper",
